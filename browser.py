@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import aiohttp
 import websockets
@@ -46,6 +47,12 @@ class NetworkTiming:
     send_start_ms: float
     send_end_ms: float
     receive_headers_end_ms: float
+    dns_start_ms: Optional[float] = None
+    dns_end_ms: Optional[float] = None
+    connect_start_ms: Optional[float] = None
+    connect_end_ms: Optional[float] = None
+    ssl_start_ms: Optional[float] = None
+    ssl_end_ms: Optional[float] = None
 
 
 @dataclass
@@ -298,6 +305,8 @@ class ChromeBrowser(Browser, _WSPlumbing):
         _WSPlumbing.__init__(self)
         self.port = port
         self._network_q: asyncio.Queue = asyncio.Queue()
+        # rid -> {url, created_ms, handshake_sent_ms}  (all in CDP monotonic ms)
+        self._ws_urls: dict[str, dict] = {}
 
     async def attach_or_launch(self, target_url: str) -> None:
         if not port_in_use(DEBUG_HOST, self.port):
@@ -334,16 +343,24 @@ class ChromeBrowser(Browser, _WSPlumbing):
             else:
                 raise RuntimeError(f"Chrome debugger did not respond on :{self.port}")
 
-            # Find or create a ChatGPT tab.
+            # Find an existing tab for target_url's host, or reuse the first
+            # page tab — never open a new tab automatically.
+            target_host = urlparse(target_url).netloc
             async with sess.get(f"http://{DEBUG_HOST}:{self.port}/json") as r:
                 targets = await r.json()
             ws_url = None
+            # 1. Prefer a tab already on the target host.
             for t in targets:
-                if t.get("type") == "page" and (
-                    "chatgpt.com" in t.get("url", "") or "chat.openai.com" in t.get("url", "")
-                ):
+                if t.get("type") == "page" and target_host and target_host in t.get("url", ""):
                     ws_url = t["webSocketDebuggerUrl"]
                     break
+            # 2. Fall back to the first available page tab.
+            if not ws_url:
+                for t in targets:
+                    if t.get("type") == "page":
+                        ws_url = t["webSocketDebuggerUrl"]
+                        break
+            # 3. Only open a new tab if the browser has no page tabs at all.
             if not ws_url:
                 async with sess.put(f"http://{DEBUG_HOST}:{self.port}/json/new?{target_url}") as r:
                     if r.status >= 400:
@@ -439,11 +456,23 @@ class ChromeBrowser(Browser, _WSPlumbing):
             t = resp.get("timing")
             timing = None
             if t:
+                def _norm(v: Optional[float]) -> Optional[float]:
+                    if v is None:
+                        return None
+                    fv = float(v)
+                    return fv if fv >= 0 else None
+
                 timing = NetworkTiming(
                     request_time_ms=t["requestTime"] * 1000.0,
                     send_start_ms=t["sendStart"],
                     send_end_ms=t["sendEnd"],
                     receive_headers_end_ms=t["receiveHeadersEnd"],
+                    dns_start_ms=_norm(t.get("dnsStart")),
+                    dns_end_ms=_norm(t.get("dnsEnd")),
+                    connect_start_ms=_norm(t.get("connectStart")),
+                    connect_end_ms=_norm(t.get("connectEnd")),
+                    ssl_start_ms=_norm(t.get("sslStart")),
+                    ssl_end_ms=_norm(t.get("sslEnd")),
                 )
             self._network_q.put_nowait(NetworkEvent(
                 type="response_received", request_id=rid, timestamp_ns=ts,
@@ -464,6 +493,59 @@ class ChromeBrowser(Browser, _WSPlumbing):
                 type="loading_failed", request_id=rid, timestamp_ns=ts,
                 error=params.get("errorText"),
             ))
+        elif method == "Network.webSocketCreated" and rid:
+            url = params.get("url")
+            if url:
+                self._ws_urls[rid] = {
+                    "url": url,
+                    "created_ms": (params.get("timestamp") or 0) * 1000.0,
+                    "handshake_sent_ms": None,
+                }
+        elif method == "Network.webSocketWillSendHandshakeRequest" and rid:
+            info = self._ws_urls.get(rid)
+            if info:
+                info["handshake_sent_ms"] = (params.get("timestamp") or 0) * 1000.0
+            self._network_q.put_nowait(NetworkEvent(
+                type="request_will_be_sent", request_id=rid, timestamp_ns=ts,
+                url=info["url"] if info else None, method="WEBSOCKET",
+                monotonic_ms=(params.get("timestamp") or 0) * 1000.0,
+            ))
+        elif method == "Network.webSocketHandshakeResponseReceived" and rid:
+            resp = params.get("response", {})
+            # WebSocketResponse carries no .timing field in CDP.
+            # Use sent_ms as the request_time baseline so all offsets are small
+            # and positive.  webSocketCreated has no timestamp, so we cannot
+            # compute DNS/connect/stalled phases — those are left None.
+            info = self._ws_urls.get(rid, {})
+            sent_ms: float = info.get("handshake_sent_ms") or 0.0
+            response_ms: float = (params.get("timestamp") or 0) * 1000.0
+            ws_timing = NetworkTiming(
+                request_time_ms=sent_ms,
+                send_start_ms=0.0,
+                send_end_ms=0.0,
+                receive_headers_end_ms=max(0.0, response_ms - sent_ms),
+            )
+            self._network_q.put_nowait(NetworkEvent(
+                type="response_received", request_id=rid, timestamp_ns=ts,
+                status=resp.get("status"), timing=ws_timing,
+            ))
+        elif method == "Network.webSocketFrameReceived" and rid:
+            self._network_q.put_nowait(NetworkEvent(
+                type="data_received", request_id=rid, timestamp_ns=ts,
+                monotonic_ms=(params.get("timestamp") or 0) * 1000.0,
+            ))
+        elif method == "Network.webSocketClosed" and rid:
+            self._network_q.put_nowait(NetworkEvent(
+                type="loading_finished", request_id=rid, timestamp_ns=ts,
+                monotonic_ms=(params.get("timestamp") or 0) * 1000.0,
+            ))
+            self._ws_urls.pop(rid, None)
+        elif method == "Network.webSocketFrameError" and rid:
+            self._network_q.put_nowait(NetworkEvent(
+                type="loading_failed", request_id=rid, timestamp_ns=ts,
+                error=params.get("errorMessage") or "webSocketFrameError",
+            ))
+            self._ws_urls.pop(rid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -509,15 +591,19 @@ class EdgeBrowser(ChromeBrowser):
             else:
                 raise RuntimeError(f"Edge debugger did not respond on :{self.port}")
 
+            target_host = urlparse(target_url).netloc
             async with sess.get(f"http://{DEBUG_HOST}:{self.port}/json") as r:
                 targets = await r.json()
             ws_url = None
             for t in targets:
-                if t.get("type") == "page" and (
-                    "chatgpt.com" in t.get("url", "") or "chat.openai.com" in t.get("url", "")
-                ):
+                if t.get("type") == "page" and target_host and target_host in t.get("url", ""):
                     ws_url = t["webSocketDebuggerUrl"]
                     break
+            if not ws_url:
+                for t in targets:
+                    if t.get("type") == "page":
+                        ws_url = t["webSocketDebuggerUrl"]
+                        break
             if not ws_url:
                 async with sess.put(f"http://{DEBUG_HOST}:{self.port}/json/new?{target_url}") as r:
                     if r.status >= 400:
@@ -632,16 +718,17 @@ class FirefoxBrowser(Browser, _WSPlumbing):
             "network.fetchError",
         ]})
 
-        # Find a context already on chatgpt.com if possible; otherwise the
-        # first top-level context. The crawler will navigate explicitly.
+        # Find a context already on target_url's host if possible; otherwise
+        # the first top-level context. The crawler will navigate explicitly.
+        target_host = urlparse(target_url).netloc
         tree = await self._call("browsingContext.getTree", {})
         contexts = tree.get("contexts", [])
         if not contexts:
             raise RuntimeError("no browsing context available in Firefox")
         chosen = None
         for ctx in contexts:
-            url = ctx.get("url", "") or ""
-            if "chatgpt.com" in url or "chat.openai.com" in url:
+            ctx_url = ctx.get("url", "") or ""
+            if target_host and target_host in ctx_url:
                 chosen = ctx
                 break
         self._context_id = (chosen or contexts[0])["context"]
