@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Human-like ChatGPT crawler — works with Chrome (CDP) or Firefox (BiDi).
+"""Human-like ChatGPT crawler — works with Chrome (CDP), Edge (CDP), or Firefox (BiDi).
 
 Usage:
     python crawler.py --setup                                  # first-time OKTA login
     python crawler.py --setup --browser firefox                # same, on Firefox
+    python crawler.py --setup --browser edge                   # same, on Edge
     python crawler.py "日本の首都はどこですか？"                  # default: chrome
     python crawler.py --browser firefox "..."                  # use Firefox
+    python crawler.py --browser edge "..."                     # use Edge
 """
 
 from __future__ import annotations
@@ -27,8 +29,8 @@ from browser import Browser, NetworkEvent, NetworkTiming, make_browser
 
 CHATGPT_URL = "https://chatgpt.com"
 CSV_PATH = Path(__file__).resolve().parent / "results.csv"
-# Match exactly /backend-api/conversation or /backend-api/f/conversation (no trailing path).
-CONVERSATION_URL_RE = re.compile(r"/backend-api/(?:f/)?conversation(?:\?|$)")
+# Match conversation endpoints from both authenticated and anonymous routes.
+CONVERSATION_URL_RE = re.compile(r"/backend-(?:api|anon)/(?:f/)?conversation(?:\?|$)")
 ANSWER_TIMEOUT_SEC = 90.0
 
 CRAWLER_HOOK_SCRIPT = r"""
@@ -430,7 +432,7 @@ def append_csv(row: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Human-like ChatGPT crawler (Chrome CDP / Firefox BiDi)")
-    parser.add_argument("--browser", choices=["chrome", "firefox"], default="chrome",
+    parser.add_argument("--browser", choices=["chrome", "edge", "firefox"], default="chrome",
                         help="使用するブラウザ (default: chrome)")
     parser.add_argument("--setup", action="store_true",
                         help="ブラウザを起動して OKTA 手動ログイン用のプロファイルを準備する")

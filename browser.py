@@ -118,6 +118,39 @@ def find_chrome_path() -> Optional[str]:
     return None
 
 
+def find_edge_path() -> Optional[str]:
+    system = platform.system()
+    if system == "Darwin":
+        candidates = [
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            str(Path.home() / "Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        ]
+    elif system == "Windows":
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            rf"{program_files}\Microsoft\Edge\Application\msedge.exe",
+            rf"{program_files_x86}\Microsoft\Edge\Application\msedge.exe",
+        ]
+        if local_app:
+            candidates.append(rf"{local_app}\Microsoft\Edge\Application\msedge.exe")
+    else:
+        for name in ("microsoft-edge", "microsoft-edge-stable", "msedge"):
+            found = shutil.which(name)
+            if found:
+                return found
+        candidates = [
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/microsoft-edge-stable",
+            "/opt/microsoft/msedge/msedge",
+        ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def find_firefox_path() -> Optional[str]:
     system = platform.system()
     if system == "Darwin":
@@ -431,6 +464,73 @@ class ChromeBrowser(Browser, _WSPlumbing):
                 type="loading_failed", request_id=rid, timestamp_ns=ts,
                 error=params.get("errorText"),
             ))
+
+
+# ---------------------------------------------------------------------------
+# Edge (CDP) — identical protocol to Chrome; only executable and profile differ
+# ---------------------------------------------------------------------------
+
+class EdgeBrowser(ChromeBrowser):
+    name = "edge"
+    profile_dir = Path.home() / "edge-chatgpt-profile"
+
+    async def attach_or_launch(self, target_url: str) -> None:
+        if not port_in_use(DEBUG_HOST, self.port):
+            edge_path = find_edge_path()
+            if not edge_path:
+                print(f"[error] Microsoft Edge not found on this system ({platform.system()}).", file=sys.stderr)
+                sys.exit(1)
+            self.profile_dir.mkdir(parents=True, exist_ok=True)
+            args = [
+                edge_path,
+                f"--remote-debugging-port={self.port}",
+                f"--user-data-dir={self.profile_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--restore-last-session",
+                target_url,
+            ]
+            proc = subprocess.Popen(args, **_detached_popen_kwargs())
+            print(f"[info] launched Edge (pid={proc.pid}) profile={self.profile_dir}", file=sys.stderr)
+        else:
+            print(f"[info] port {self.port} in use; attaching to existing Edge.", file=sys.stderr)
+
+        # Wait for the debugger HTTP endpoint (same as Chrome).
+        deadline = time.monotonic() + 20.0
+        async with aiohttp.ClientSession() as sess:
+            while time.monotonic() < deadline:
+                try:
+                    async with sess.get(f"http://{DEBUG_HOST}:{self.port}/json/version") as r:
+                        if r.status == 200:
+                            break
+                except aiohttp.ClientError:
+                    pass
+                await asyncio.sleep(0.3)
+            else:
+                raise RuntimeError(f"Edge debugger did not respond on :{self.port}")
+
+            async with sess.get(f"http://{DEBUG_HOST}:{self.port}/json") as r:
+                targets = await r.json()
+            ws_url = None
+            for t in targets:
+                if t.get("type") == "page" and (
+                    "chatgpt.com" in t.get("url", "") or "chat.openai.com" in t.get("url", "")
+                ):
+                    ws_url = t["webSocketDebuggerUrl"]
+                    break
+            if not ws_url:
+                async with sess.put(f"http://{DEBUG_HOST}:{self.port}/json/new?{target_url}") as r:
+                    if r.status >= 400:
+                        async with sess.get(f"http://{DEBUG_HOST}:{self.port}/json/new?{target_url}") as r2:
+                            ws_url = (await r2.json())["webSocketDebuggerUrl"]
+                    else:
+                        ws_url = (await r.json())["webSocketDebuggerUrl"]
+
+        await self._connect(ws_url)
+        await self._call("Page.enable")
+        await self._call("Network.enable")
+        await self._call("Runtime.enable")
+        await self._call("DOM.enable")
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +896,8 @@ def make_browser(name: str, port: int = DEFAULT_PORT) -> Browser:
     name = name.lower()
     if name == "chrome":
         return ChromeBrowser(port=port)
+    if name == "edge":
+        return EdgeBrowser(port=port)
     if name == "firefox":
         return FirefoxBrowser(port=port)
-    raise ValueError(f"unknown browser: {name!r} (expected 'chrome' or 'firefox')")
+    raise ValueError(f"unknown browser: {name!r} (expected 'chrome', 'edge', or 'firefox')")
