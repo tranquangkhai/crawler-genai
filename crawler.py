@@ -214,7 +214,12 @@ async def focus_prompt_input(browser: Browser) -> Optional[dict]:
         'div[data-testid="chat-input"]',
         '[data-testid*="composer"] textarea',
         '[data-testid*="composer"] div[contenteditable="true"]',
+        // M365 corporate Copilot uses a span with a specific id
+        '#m365-chat-editor-target-element',
+        'span[role="textbox"]',
         'div[role="textbox"][contenteditable="true"]',
+        '[role="textbox"][contenteditable="true"]',
+        '[role="textbox"]',
         'textarea[aria-label]',
         'textarea[placeholder]',
         // Generic fallbacks
