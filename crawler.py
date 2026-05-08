@@ -151,6 +151,7 @@ CSV_COLUMNS = [
     "net_response_received", "net_loading_finished",
     "stalled_ms", "request_sent_ms", "waiting_ms", "content_download_ms", "total_ms",
     "http_status", "request_id", "notes",
+    "enter_pressed_date", "stopwatch_duration_s", "waiting_response_s",
 ]
 
 
@@ -499,8 +500,16 @@ async def run_prompt(prompt: str, browser_name: str, target: str) -> dict:
                 content_download_ms = finish_ms - (timing.request_time_ms + timing.receive_headers_end_ms)
                 total_ms = finish_ms - (timing.request_time_ms + timing.send_start_ms)
 
-        def fmt_ms(v): return f"{v:.3f}" if isinstance(v, (int, float)) else ""
+        def fmt_ms(v): return f"{v:.2f}" if isinstance(v, (int, float)) else ""
+        def fmt_s(v): return f"{v:.2f}" if isinstance(v, (int, float)) else ""
         def iso_from_epoch_ms(ms): return iso_now(int(ms * 1_000_000)) if ms else ""
+
+        enter_pressed_date = datetime.fromtimestamp(enter_ns / 1e9).strftime("%Y/%m/%d %H:%M")
+        stopwatch_duration_s = (
+            (visual_done_ms - enter_ns / 1_000_000) / 1000
+            if visual_done_ms is not None else None
+        )
+        waiting_response_s = waiting_ms / 1000 if waiting_ms is not None else None
 
         net_done_ns = net["loading_finished_ts_ns"] or net["last_data_received_ts_ns"]
         return {
@@ -524,6 +533,9 @@ async def run_prompt(prompt: str, browser_name: str, target: str) -> dict:
             "http_status": str(net["http_status"] or ""),
             "request_id": net["request_id"] or "",
             "notes": "; ".join(notes),
+            "enter_pressed_date": enter_pressed_date,
+            "stopwatch_duration_s": fmt_s(stopwatch_duration_s),
+            "waiting_response_s": fmt_s(waiting_response_s),
         }
     finally:
         await browser.close()
