@@ -7,6 +7,8 @@ so the rest of the crawler doesn't care which browser it's driving.
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import ctypes.wintypes
 import json
 import os
 import platform
@@ -88,6 +90,31 @@ def _detached_popen_kwargs() -> dict:
     else:
         kwargs["start_new_session"] = True
     return kwargs
+
+
+def _os_focus_window(window_class: str) -> None:
+    """Raise the first visible window of *window_class* to the OS foreground.
+
+    Windows-only (uses ctypes + user32). A no-op on other platforms.
+    Swallows all errors so a focus failure never aborts the crawl.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(window_class, None)
+        if not hwnd:
+            return
+        user32.ShowWindow(hwnd, 9)           # SW_RESTORE — un-minimise if needed
+        # Simulate a brief Alt key press/release so Windows grants the
+        # foreground-lock permission to this process.
+        VK_MENU = 0x12
+        KEYEVENTF_KEYUP = 0x0002
+        user32.keybd_event(VK_MENU, 0, 0, 0)
+        user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
 
 
 def find_chrome_path() -> Optional[str]:
@@ -225,6 +252,9 @@ class Browser(ABC):
 
     @abstractmethod
     async def press_key(self, key: str, shift: bool = False) -> None: ...
+
+    @abstractmethod
+    async def bring_to_front(self) -> None: ...
 
     @abstractmethod
     def network_events(self) -> asyncio.Queue: ...
@@ -422,6 +452,10 @@ class ChromeBrowser(Browser, _WSPlumbing):
                 "windowsVirtualKeyCode": windows_codes.get(key, 0),
                 "modifiers": 1 if shift else 0,
             })
+
+    async def bring_to_front(self) -> None:
+        await self._call("Page.bringToFront")
+        _os_focus_window("Chrome_WidgetWin_1")
 
     def network_events(self) -> asyncio.Queue:
         return self._network_q
@@ -885,6 +919,13 @@ class FirefoxBrowser(Browser, _WSPlumbing):
             "context": self._context_id,
             "actions": [{"type": "key", "id": "kbd1", "actions": actions}],
         })
+
+    async def bring_to_front(self) -> None:
+        try:
+            await self._call("browsingContext.activate", {"context": self._context_id})
+        except Exception:
+            pass
+        _os_focus_window("MozillaWindowClass")
 
     def network_events(self) -> asyncio.Queue:
         return self._network_q

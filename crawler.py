@@ -303,6 +303,8 @@ async def run_prompt(prompt: str, browser_name: str, target: str) -> dict:
         )
         await browser.evaluate(CRAWLER_HOOK_SCRIPT, await_promise=False)
 
+        await browser.bring_to_front()
+        await asyncio.sleep(0.3)   # allow OS time to actually raise the window
         box = await focus_prompt_input(browser)
         if not box:
             print("[error] プロンプト入力欄が見つかりません。", file=sys.stderr)
@@ -393,6 +395,14 @@ async def run_prompt(prompt: str, browser_name: str, target: str) -> dict:
         await human_type(browser, prompt)
         typing_end_ns = time.time_ns()
         await asyncio.sleep(random.uniform(0.3, 0.8))
+
+        # Re-focus the input before pressing Enter — focus can be silently lost
+        # during the long typing loop, and dispatchKeyEvent requires the target
+        # element to be focused in the page.
+        await browser.bring_to_front()
+        await asyncio.sleep(0.15)
+        await focus_prompt_input(browser)
+
         enter_armed.set()
         enter_ns = time.time_ns()
         await browser.press_key("Enter")
