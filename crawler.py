@@ -233,6 +233,7 @@ async def focus_prompt_input(browser: Browser) -> Optional[dict]:
           el.scrollIntoView({block: 'center'});
           const r = el.getBoundingClientRect();
           if (r.width > 0 && r.height > 0) {
+            el.focus();
             return {x: r.left + r.width / 2, y: r.top + r.height / 2};
           }
         }
@@ -244,7 +245,7 @@ async def focus_prompt_input(browser: Browser) -> Optional[dict]:
         box = await browser.evaluate(js)
         if box:
             await browser.click(box["x"], box["y"])
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.3)   # wait for DOM focus to settle
             return box
         await asyncio.sleep(0.5)
     return None
@@ -392,6 +393,7 @@ async def run_prompt(prompt: str, browser_name: str, target: str) -> dict:
         # ------------------------------------------------------------------
         # Type prompt + press Enter
         # ------------------------------------------------------------------
+        await asyncio.sleep(0.3)   # let focus settle before typing starts
         typing_start_ns = time.time_ns()
         await human_type(browser, prompt)
         typing_end_ns = time.time_ns()
@@ -562,30 +564,52 @@ def main() -> None:
     )
     parser.add_argument("--setup", action="store_true",
                         help="ブラウザを起動して OKTA 手動ログイン用のプロファイルを準備する")
-    parser.add_argument("prompt", nargs="?", help="ChatGPT に投入するプロンプト文字列")
+    parser.add_argument("prompt", nargs="?", help="ChatGPT に投入するプロンプト文字列 (省略時は --prompts-file を使用)")
+    parser.add_argument("--prompts-file", metavar="FILE",
+                        help="実行するプロンプトを1行1件で記載したテキストファイル")
     args = parser.parse_args()
 
     if args.setup:
         asyncio.run(setup_mode(args.browser, args.target))
         return
 
-    if not args.prompt:
-        parser.error("prompt が必要です (または --setup を指定)。")
+    # Build the prompt list from either --prompts-file or the single inline prompt.
+    if args.prompts_file:
+        prompts_path = Path(args.prompts_file)
+        if not prompts_path.exists():
+            parser.error(f"prompts file not found: {prompts_path}")
+        prompts = [
+            line.strip()
+            for line in prompts_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        if not prompts:
+            parser.error(f"no prompts found in {prompts_path}")
+    elif args.prompt:
+        prompts = [args.prompt]
+    else:
+        parser.error("prompt が必要です (インライン指定または --prompts-file)。")
 
-    row = asyncio.run(run_prompt(args.prompt, args.browser, args.target))
-    append_csv(row)
     def _fmt_field(value: str) -> str:
         return f"{value}ms" if value else "N/A"
 
-    print(
-        f"[done] browser={row['browser']}  target={row['target']}  run_id={row['run_id']}  "
-        f"stalled={_fmt_field(row['stalled_ms'])}  "
-        f"request_sent={_fmt_field(row['request_sent_ms'])}  "
-        f"waiting={_fmt_field(row['waiting_ms'])}  "
-        f"content_download={_fmt_field(row['content_download_ms'])}  "
-        f"total={_fmt_field(row['total_ms'])}",
-        file=sys.stderr,
-    )
+    for idx, prompt in enumerate(prompts):
+        print(f"[info] ({idx + 1}/{len(prompts)}) prompt={prompt!r}", file=sys.stderr)
+        row = asyncio.run(run_prompt(prompt, args.browser, args.target))
+        append_csv(row)
+        print(
+            f"[done] browser={row['browser']}  target={row['target']}  run_id={row['run_id']}  "
+            f"stalled={_fmt_field(row['stalled_ms'])}  "
+            f"request_sent={_fmt_field(row['request_sent_ms'])}  "
+            f"waiting={_fmt_field(row['waiting_ms'])}  "
+            f"content_download={_fmt_field(row['content_download_ms'])}  "
+            f"total={_fmt_field(row['total_ms'])}",
+            file=sys.stderr,
+        )
+        if idx < len(prompts) - 1:
+            wait_s = random.uniform(30, 45)
+            print(f"[info] 次のプロンプトまで {wait_s:.1f}s 待機します…", file=sys.stderr)
+            time.sleep(wait_s)
 
 
 if __name__ == "__main__":
